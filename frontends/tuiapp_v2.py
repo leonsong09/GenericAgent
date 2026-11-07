@@ -3682,6 +3682,29 @@ C_LAVENDER = C_PURPLE      # lane 配色 → 跟主题紫
 C_RED      = "#e5534b"     # diff 删除行(固定语义色)
 
 
+def _tui_hub_tasks(sess) -> list:
+    """Hub view adapter: fold this TUI session's messages into hub's shape.
+
+    hub only understands `[{"input": ..., "outputs": [...]}]` — one entry per
+    user turn plus the assistant/system steps that followed.  TUI's agent has
+    no `all_outputs` attribute, so without this hook `hub.connect()` has
+    nothing to publish and the web panel renders every session as `(empty)`.
+    """
+    try:
+        tasks, cur = [], None
+        for m in (getattr(sess, "messages", None) or ()):
+            role = getattr(m, "role", "") or ""
+            text = getattr(m, "content", "") or ""
+            if role == "user":
+                cur = {"input": text, "outputs": []}
+                tasks.append(cur)
+            elif cur is not None and text.strip():
+                cur["outputs"].append(text)   # assistant body / system notices
+        return tasks
+    except Exception:
+        return []
+
+
 class GenericAgentTUI(App[None]):
 
     CSS = _MAIN_CSS
@@ -3894,6 +3917,38 @@ class GenericAgentTUI(App[None]):
         if size != self._last_size:
             self._last_size = size
             self._apply_responsive_layout()
+        self._drain_hub_inbox()
+
+    def _drain_hub_inbox(self) -> None:
+        """Consume text delivered by hub / WorkBuddy / the web panel.
+
+        `hub.connect`'s default `put` parks text in `agent._hub_inbox` while the
+        agent is idle (and answers 409 when busy — it never queues).  fsapp.py
+        consumes that queue; the TUI used to connect to hub without draining it,
+        so remote delivery sat in the list forever.  Text goes through the same
+        entrance as typing (`_dispatch_user_text`), so `/stop`, `!ls`, `@file`
+        and streaming/abort behave identically.
+
+        Only the visible, idle session is served: a background session must not
+        be woken up by a remote command, so its delivery waits in the queue
+        until the user switches to it.
+        """
+        try:
+            sess = self.current
+            if sess is None or sess.status == "running":
+                return
+            inbox = getattr(sess.agent, "_hub_inbox", None)
+            if not inbox:
+                return
+            text = inbox.pop(0)
+            # `/exit` means "quit the frontend" here — never send it to the model.
+            if isinstance(text, str) and text.strip().lower() in ("/exit", "/quit"):
+                self.exit()
+                return
+            if isinstance(text, str) and text.strip():
+                self._dispatch_user_text(text)
+        except Exception:
+            pass
 
     def _schedule_input_repaint(self) -> None:
         if self._apple_terminal_ime and not self._input_repaint_pending:
@@ -4018,6 +4073,16 @@ class GenericAgentTUI(App[None]):
         try:
             from continue_cmd import acquire_birth_lock
             acquire_birth_lock(agent, agent_id)   # 原地复原:出生持锁,占用检测可见
+        except Exception:
+            pass
+        try:
+            import importlib
+            _hub_spec = importlib.util.spec_from_file_location(
+                "hub", os.path.join(FRONTENDS_DIR, "hub.py"))
+            _hub = importlib.util.module_from_spec(_hub_spec)
+            _hub_spec.loader.exec_module(_hub)
+            agent._hub = _hub.connect(agent, f"tui-{agent_id}",
+                                      get_outputs=lambda s=sess: _tui_hub_tasks(s))
         except Exception:
             pass
         thread = threading.Thread(target=agent.run, name=f"ga-tui-agent-{agent_id}", daemon=True)
@@ -4541,6 +4606,30 @@ class GenericAgentTUI(App[None]):
         thread = getattr(session, "thread", None)
         if thread is not None:
             thread.join(timeout=5.0)
+        # Retire the hub client too.  It is a daemon thread holding a live
+        # WebSocket + a registered peer name: dropping the session without
+        # closing it left the panel showing a "ghost peer" that answers
+        # nothing, and leaked one socket per drop.
+        try:
+            hub = getattr(session.agent, "_hub", None)
+            if hub is not None:
+                hub.close()
+        except Exception:
+            pass
+        try:
+            session.agent._hub = None
+        except Exception:
+            pass
+        try:
+            inbox = getattr(session.agent, "_hub_inbox", None)
+            if inbox is not None:
+                inbox.clear()
+        except Exception:
+            pass
+        # Widgets of this session are detached by the caller's remount; drop
+        # the Python-side refs now so the detached subtree is collectable.
+        for m in getattr(session, "messages", None) or ():
+            self._forget_message_widgets(m)
 
     def action_drop_session(self) -> None:
         # Sidebar-only removal: drops the in-memory session so it stops appearing
@@ -4759,6 +4848,44 @@ class GenericAgentTUI(App[None]):
         # Padding changes recompute layout asynchronously — defer remount one frame.
         self.call_after_refresh(self._remount_current_session)
 
+    @staticmethod
+    def _forget_message_widgets(m) -> None:
+        """Drop every Python-side widget reference a ChatMessage holds.
+
+        A removed widget is only garbage once nothing points at it; the message
+        object outlives the DOM (it is the model), so leaving `_role_widget`
+        and friends set keeps the whole detached subtree alive for as long as
+        the message survives — across session switches, /clear, rewind and
+        history trimming.  Callers that remove widgets must call this after
+        (or instead of) `remove()`.
+        """
+        for attr in ("_role_widget", "_body_widget", "_hint_widget", "_spinner_widget"):
+            try:
+                setattr(m, attr, None)
+            except Exception:
+                pass
+        try:
+            m._segment_widgets = []
+        except Exception:
+            pass
+        try:
+            m._segment_sig = ()
+        except Exception:
+            pass
+        try:
+            m._cached_body = None
+        except Exception:
+            pass
+        try:
+            m._seg_render_cache.clear()
+        except Exception:
+            pass
+
+    def _forget_session_widgets(self, sess) -> None:
+        """Detach this app's references to every widget of `sess` (in place)."""
+        for m in getattr(sess, "messages", None) or ():
+            self._forget_message_widgets(m)
+
     def _remount_current_session(self) -> None:
         if self.current_id is None or not self.is_mounted:
             return
@@ -4885,6 +5012,19 @@ class GenericAgentTUI(App[None]):
         inp.reset()
         self._hide_palette()
         self._resize_input(inp)
+        if not text:
+            return
+        self._dispatch_user_text(text, images=images)
+
+    def _dispatch_user_text(self, text: str, images: Optional[list] = None) -> None:
+        """The single entrance for "user said this" — typed or remote.
+
+        Handles `!shell`, `/command`, `@mention` rewriting and finally
+        `submit_user_message`.  Remote delivery (hub / WorkBuddy / web panel)
+        must come through here too, otherwise a `/stop` or `!ls` sent from the
+        panel would be pasted into the model as plain chat text.
+        """
+        text = (text or "").rstrip()
         if not text:
             return
         # Pick up mykey.py edits without restart: load_llm_sessions() is a
@@ -5015,9 +5155,7 @@ class GenericAgentTUI(App[None]):
             if w is not None:
                 try: w.remove()
                 except Exception: pass
-        msg._role_widget = None
-        msg._hint_widget = None
-        msg._body_widget = None
+        self._forget_message_widgets(msg)
         sess = self.sessions.get(self.current_id)
         if sess and msg in sess.messages:
             sess.messages.remove(msg)
@@ -5513,6 +5651,7 @@ class GenericAgentTUI(App[None]):
         try:
             rebuilt = [ChatMessage(role=h["role"], content=h["content"])
                        for h in continue_extract(log_path)]
+            self._forget_session_widgets(sess)
             sess.messages.clear()
             sess.messages.extend(rebuilt)
         except Exception:
@@ -5577,6 +5716,7 @@ class GenericAgentTUI(App[None]):
         return f"↩ 已回退 {n} 轮（内存级·不持久，移除 {removed} 条历史）"
 
     def _cmd_clear(self, args, raw):
+        self._forget_session_widgets(self.current)
         self.current.messages.clear()
         self._remount_current_session()
         self._refresh_topbar()
@@ -5956,6 +6096,7 @@ class GenericAgentTUI(App[None]):
         except Exception:
             pass
         def _finish():
+            self._forget_session_widgets(sess)
             sess.messages.clear()
             # Plan state belongs to the *previous* conversation. Clearing it
             # along with messages stops the planbar from leaking stale items
@@ -6537,6 +6678,17 @@ class GenericAgentTUI(App[None]):
         # sweep mops up anything a crash leaves behind.
         for s in list(self.sessions.values()):
             _rmdir_if_empty(getattr(s.agent, 'task_dir', None))
+            # Close every hub client: they are daemon threads with a live
+            # WebSocket registered under a peer name.  Leaving them open on a
+            # clean quit makes the panel list dead peers until the socket
+            # times out (and makes the process look alive to `hub.peers()`).
+            try:
+                hub = getattr(s.agent, "_hub", None)
+                if hub is not None:
+                    hub.close()
+                    s.agent._hub = None
+            except Exception:
+                pass
 
     def _run_shell(self, cmd: str) -> None:
         """`!cmd` magic: run `cmd` in the user's shell (Git Bash / pwsh /
